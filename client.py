@@ -9,7 +9,33 @@ import threading
 import json
 import os
 import base64
+import struct
 from datetime import datetime
+
+# =========================
+# Utilitários de framing
+# =========================
+def send_json(sock: socket.socket, obj: dict):
+    data = json.dumps(obj).encode('utf-8')
+    header = struct.pack('!I', len(data))  # 4 bytes big-endian com o tamanho do JSON
+    sock.sendall(header)
+    sock.sendall(data)
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Conexão fechada pelo par")
+        buf.extend(chunk)
+    return bytes(buf)
+
+def recv_json(sock: socket.socket) -> dict:
+    header = _recv_exact(sock, 4)
+    (length,) = struct.unpack('!I', header)
+    payload = _recv_exact(sock, length)
+    return json.loads(payload.decode('utf-8'))
+
 
 class ChatClient:
     def __init__(self):
@@ -45,11 +71,7 @@ class ChatClient:
         """Escuta mensagens do servidor"""
         while self.connected and self.running:
             try:
-                data = self.socket.recv(4096)
-                if not data:
-                    break
-                
-                message = json.loads(data.decode('utf-8'))
+                message = recv_json(self.socket)
                 self.handle_server_message(message)
                 
             except ConnectionResetError:
@@ -57,6 +79,9 @@ class ChatClient:
                 break
             except json.JSONDecodeError:
                 print("\n[ERRO] Mensagem inválida recebida do servidor")
+            except ConnectionError:
+                # Conexão fechada pelo par
+                break
             except Exception as e:
                 print(f"\n[ERRO] Erro ao receber mensagem: {e}")
                 break
@@ -159,7 +184,7 @@ class ChatClient:
     def send_message(self, message: dict):
         """Envia mensagem para o servidor"""
         try:
-            self.socket.send(json.dumps(message).encode('utf-8'))
+            send_json(self.socket, message)
         except Exception as e:
             print(f"[ERRO] Não foi possível enviar mensagem: {e}")
     

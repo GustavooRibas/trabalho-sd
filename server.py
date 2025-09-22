@@ -9,8 +9,34 @@ import threading
 import json
 import os
 import base64
+import struct
 from datetime import datetime
 from typing import Dict, List, Set
+
+# =========================
+# Utilitários de framing
+# =========================
+def send_json(sock: socket.socket, obj: dict):
+    data = json.dumps(obj).encode('utf-8')
+    header = struct.pack('!I', len(data))  # 4 bytes big-endian com o tamanho do JSON
+    sock.sendall(header)
+    sock.sendall(data)
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Conexão fechada pelo par")
+        buf.extend(chunk)
+    return bytes(buf)
+
+def recv_json(sock: socket.socket) -> dict:
+    header = _recv_exact(sock, 4)
+    (length,) = struct.unpack('!I', header)
+    payload = _recv_exact(sock, length)
+    return json.loads(payload.decode('utf-8'))
+
 
 class ChatServer:
     def __init__(self, host='localhost', port=12345):
@@ -63,34 +89,35 @@ class ChatServer:
         try:
             while True:
                 # Recebe dados do cliente
-                data = client_socket.recv(4096)
-                if not data:
-                    break
+                message = recv_json(client_socket)
                 
-                try:
-                    message = json.loads(data.decode('utf-8'))
-                    response = self.process_message(message, client_socket)
-                    
-                    # Se é uma mensagem de login, registra o cliente
-                    if message.get('type') == 'login' and response.get('status') == 'success':
-                        username = message['username']
-                        with self.client_lock:
-                            self.clients[username] = client_socket
-                        print(f"[SERVIDOR] Usuário {username} conectado")
-                    
-                    # Envia resposta para o cliente
-                    if response:
-                        client_socket.send(json.dumps(response).encode('utf-8'))
+                response = self.process_message(message, client_socket)
+                
+                # Se é uma mensagem de login, registra o cliente
+                if message.get('type') == 'login' and response.get('status') == 'success':
+                    username = message['username']
+                    with self.client_lock:
+                        self.clients[username] = client_socket
+                    print(f"[SERVIDOR] Usuário {username} conectado")
+                
+                # Envia resposta para o cliente
+                if response:
+                    send_json(client_socket, response)
                         
-                except json.JSONDecodeError:
-                    error_response = {
-                        'type': 'error',
-                        'message': 'Formato de mensagem inválido'
-                    }
-                    client_socket.send(json.dumps(error_response).encode('utf-8'))
-                    
+        except json.JSONDecodeError:
+            error_response = {
+                'type': 'error',
+                'message': 'Formato de mensagem inválido'
+            }
+            try:
+                send_json(client_socket, error_response)
+            except Exception:
+                pass
         except ConnectionResetError:
             print(f"[SERVIDOR] Cliente {client_address} desconectou abruptamente")
+        except ConnectionError:
+            # Conexão fechada pelo par
+            pass
         except Exception as e:
             print(f"[SERVIDOR] Erro com cliente {client_address}: {e}")
         finally:
@@ -187,7 +214,7 @@ class ChatServer:
             }
             
             try:
-                recipient_socket.send(json.dumps(notification).encode('utf-8'))
+                send_json(recipient_socket, notification)
                 return {
                     'type': 'message_response',
                     'status': 'success',
@@ -276,7 +303,7 @@ class ChatServer:
                 if member != sender and member in self.clients:
                     try:
                         member_socket = self.clients[member]
-                        member_socket.send(json.dumps(notification).encode('utf-8'))
+                        send_json(member_socket, notification)
                         delivered_count += 1
                     except:
                         continue
@@ -348,7 +375,7 @@ class ChatServer:
                         'timestamp': datetime.now().strftime("%H:%M:%S")
                     }
                     member_socket = self.clients[new_member]
-                    member_socket.send(json.dumps(notification).encode('utf-8'))
+                    send_json(member_socket, notification)
                 except:
                     pass
         
@@ -437,7 +464,7 @@ class ChatServer:
                     }
                     
                     recipient_socket = self.clients[recipient]
-                    recipient_socket.send(json.dumps(notification).encode('utf-8'))
+                    send_json(recipient_socket, notification)
                     
             else:  # file_type == 'group'
                 # Envio para grupo
@@ -473,7 +500,7 @@ class ChatServer:
                         if member != sender and member in self.clients:
                             try:
                                 member_socket = self.clients[member]
-                                member_socket.send(json.dumps(notification).encode('utf-8'))
+                                send_json(member_socket, notification)
                             except:
                                 continue
             
