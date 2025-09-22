@@ -13,16 +13,19 @@ import struct
 from datetime import datetime
 from typing import Dict, List, Set
 
-# =========================
-# Utilitários de framing
-# =========================
+
+# Camada de transporte simples: São enviados 4 bytes (tamanho do JSON) + o JSON
+# Isso garante que o receptor saiba exatamente quantos bytes ler para cada mensagem, evitando JSON truncado ou "colado" com outra mensagem
+
 def send_json(sock: socket.socket, obj: dict):
     data = json.dumps(obj).encode('utf-8')
-    header = struct.pack('!I', len(data))  # 4 bytes big-endian com o tamanho do JSON
-    sock.sendall(header)
-    sock.sendall(data)
+    header = struct.pack('!I', len(data))  # 4 bytes big-endian com o comprimento do JSON
+    sock.sendall(header)                   # sendall garante envio completo do cabeçalho
+    sock.sendall(data)                     # sendall garante envio completo do payload
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    # Lê exatamente n bytes do socket, repetindo recv até completar
+    # Isso é necessário porque recv pode retornar menos bytes do que o solicitado
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -32,6 +35,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 def recv_json(sock: socket.socket) -> dict:
+    # Primeiro lê o cabeçalho de 4 bytes, extrai o tamanho, depois lê exatamente aquele número de bytes
     header = _recv_exact(sock, 4)
     (length,) = struct.unpack('!I', header)
     payload = _recv_exact(sock, length)
@@ -89,6 +93,7 @@ class ChatServer:
         try:
             while True:
                 # Recebe dados do cliente
+                # usamos recv_json para ler exatamente uma mensagem completa
                 message = recv_json(client_socket)
                 
                 response = self.process_message(message, client_socket)
@@ -110,13 +115,14 @@ class ChatServer:
                 'message': 'Formato de mensagem inválido'
             }
             try:
+                # Resposta também vai por send_json para manter o protocolo consistente.
                 send_json(client_socket, error_response)
             except Exception:
                 pass
         except ConnectionResetError:
             print(f"[SERVIDOR] Cliente {client_address} desconectou abruptamente")
         except ConnectionError:
-            # Conexão fechada pelo par
+            # Conexão fechada pelo par — fluxo normal de término
             pass
         except Exception as e:
             print(f"[SERVIDOR] Erro com cliente {client_address}: {e}")
@@ -214,6 +220,7 @@ class ChatServer:
             }
             
             try:
+                
                 send_json(recipient_socket, notification)
                 return {
                     'type': 'message_response',
@@ -464,6 +471,7 @@ class ChatServer:
                     }
                     
                     recipient_socket = self.clients[recipient]
+                    # Entrega do arquivo via send_json para garantir mensagem completa
                     send_json(recipient_socket, notification)
                     
             else:  # file_type == 'group'
@@ -500,6 +508,7 @@ class ChatServer:
                         if member != sender and member in self.clients:
                             try:
                                 member_socket = self.clients[member]
+                                # Entrega em grupo via send_json
                                 send_json(member_socket, notification)
                             except:
                                 continue

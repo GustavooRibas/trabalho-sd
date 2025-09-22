@@ -12,16 +12,17 @@ import base64
 import struct
 from datetime import datetime
 
-# =========================
-# Utilitários de framing
-# =========================
+# Camada de transporte simples: São enviados 4 bytes (tamanho do JSON) + o JSON
+# Isso garante que o receptor saiba exatamente quantos bytes ler para cada mensagem, evitando JSON truncado ou "colado" com outra mensagem
+
 def send_json(sock: socket.socket, obj: dict):
     data = json.dumps(obj).encode('utf-8')
-    header = struct.pack('!I', len(data))  # 4 bytes big-endian com o tamanho do JSON
-    sock.sendall(header)
-    sock.sendall(data)
+    header = struct.pack('!I', len(data))  # 4 bytes big-endian com o comprimento do JSON
+    sock.sendall(header)                   # sendall garante envio completo do cabeçalho
+    sock.sendall(data)                     # sendall garante envio completo do payload
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    # Lê exatamente n bytes do socket, repetindo recv até completar
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -31,6 +32,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 def recv_json(sock: socket.socket) -> dict:
+    # Lê o cabeçalho de 4 bytes para descobrir o tamanho do JSON e depois lê exatamente esse tamanho.
     header = _recv_exact(sock, 4)
     (length,) = struct.unpack('!I', header)
     payload = _recv_exact(sock, length)
@@ -71,6 +73,7 @@ class ChatClient:
         """Escuta mensagens do servidor"""
         while self.connected and self.running:
             try:
+                # Uso de recv_json para ler a mensagem completa.
                 message = recv_json(self.socket)
                 self.handle_server_message(message)
                 
@@ -80,7 +83,6 @@ class ChatClient:
             except json.JSONDecodeError:
                 print("\n[ERRO] Mensagem inválida recebida do servidor")
             except ConnectionError:
-                # Conexão fechada pelo par
                 break
             except Exception as e:
                 print(f"\n[ERRO] Erro ao receber mensagem: {e}")
