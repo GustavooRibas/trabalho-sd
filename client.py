@@ -22,7 +22,41 @@ import threading
 import json
 import os
 import base64
+import struct  
 from datetime import datetime
+import time  
+import random  
+
+# Utilitários de framing para o cliente
+# Mesmo protocolo do servidor: 4 bytes (big-endian) com o tamanho do JSON + JSON.
+
+def send_json(sock: socket.socket, obj: dict):
+    data = json.dumps(obj).encode('utf-8')
+    header = struct.pack('!I', len(data))  #  4 bytes com o tamanho do JSON
+    sock.sendall(header)                   #  sendall do cabeçalho
+    sock.sendall(data)                     #  sendall do payload
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    # Lê exatamente n bytes (recv pode retornar menos).
+    # Com timeout configurado no socket, uma ausência de dados por muito tempo
+    # gerará socket.timeout — propagamos para o chamador (listen_server)
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except socket.timeout:  # permite detectar ausência de mensagens/heartbeats
+            raise
+        if not chunk:
+            raise ConnectionError("Conexão fechada pelo par")
+        buf.extend(chunk)
+    return bytes(buf)
+
+def recv_json(sock: socket.socket) -> dict:
+    # Lê cabeçalho (4 bytes), depois o JSON completo.
+    header = _recv_exact(sock, 4)
+    (length,) = struct.unpack('!I', header)
+    payload = _recv_exact(sock, length)
+    return json.loads(payload.decode('utf-8'))
 
 class ChatClient:
     """
@@ -64,7 +98,15 @@ class ChatClient:
         # Cria diretório de downloads se não existir
         if not os.path.exists(self.downloads_dir):
             os.makedirs(self.downloads_dir)
-    
+
+        # ---------------------------------------
+        # Configuração e estado para heartbeat/reconexão
+        # ---------------------------------------
+        self.HEARTBEAT_GRACE = int(os.getenv("CHAT_HB_GRACE", "40"))  # Segundos sem ping antes de considerar queda
+        self.RECONNECT_BASE  = float(os.getenv("CHAT_RC_BASE", "1.0")) # Backoff inicial (s)
+        self.RECONNECT_MAX   = float(os.getenv("CHAT_RC_MAX",  "30.0"))# Backoff máximo (s)
+        self._last_host = 'localhost'  # Guarda host/port da última conexão para reconectar
+        self._last_port = 12345       
     def connect_to_server(self, host='localhost', port=12345):
         """
         Estabelece conexão TCP com o servidor de chat.
@@ -82,9 +124,14 @@ class ChatClient:
         try:
             # Cria socket TCP (AF_INET = IPv4, SOCK_STREAM = TCP)
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Define timeout para permitir detectar ausência de mensagens/heartbeats
+            self.socket.settimeout(5.0)
             
             # Conecta ao servidor no endereço e porta especificados
             self.socket.connect((host, port))
+            
+            # Guarda último host/port para reconexão
+            self._last_host, self._last_port = host, port
             
             # Marca como conectado
             self.connected = True
@@ -113,37 +160,119 @@ class ChatClient:
         - JSONDecodeError: Mensagem malformada recebida
         - Exception: Outros erros de comunicação
         """
+        last_ping = time.time()  # Momento do último tráfego/heartbeat recebido
+        backoff = self.RECONNECT_BASE  # Backoff inicial para reconexão
+
         while self.connected and self.running:
             try:
                 # Recebe dados do servidor (buffer de 4096 bytes)
-                data = self.socket.recv(4096)
+                # Substituído por leitura com framing: uma mensagem completa por vez.
+                message = recv_json(self.socket)
+                # Tráfego recebido — atualiza relógio e zera backoff
+                last_ping = time.time()
+                backoff = self.RECONNECT_BASE
                 
-                # Se não recebeu dados, conexão foi fechada
-                if not data:
-                    break
-                
+                # Responde imediatamente a heartbeat_ping
+                if message.get('type') == 'heartbeat_ping':
+                    try:
+                        self.send_message({'type': 'heartbeat_ack'})  # ACK para o servidor
+                    except Exception:
+                        # Se até mesmo responder falhar, forçaremos reconexão no próximo loop
+                        pass
+                    continue  # Nada mais a fazer para pings
+
                 # Decodifica bytes para string UTF-8 e converte JSON para dict
-                message = json.loads(data.decode('utf-8'))
+                # Decodificação/parse já feitos por recv_json.
                 
                 # Processa mensagem recebida
                 self.handle_server_message(message)
                 
+            except socket.timeout:
+                # Sem receber nada por um período; checa se passou do grace
+                if (time.time() - last_ping) > self.HEARTBEAT_GRACE:
+                    print("\n[WARN] Sem heartbeat do servidor — tentando reconectar...")
+                    if not self._attempt_reconnect_inline(backoff): 
+                        # A reconexão inline falhou — cresce backoff e tenta novamente no próximo timeout
+                        backoff = min(self.RECONNECT_MAX, backoff * 2) * (0.5 + random.random())
+                    else:
+                        # Reconectado — reseta marcadores
+                        last_ping = time.time()
+                        backoff = self.RECONNECT_BASE
+                # Caso contrário, apenas continua aguardando
+                continue
+
             except ConnectionResetError:
                 # Servidor fechou conexão abruptamente
-                print("\n[ERRO] Conexão com servidor perdida")
-                break
+                print("\n[ERRO] Conexão com servidor perdida — tentando reconectar...")
+                if not self._attempt_reconnect_inline(backoff):
+                    backoff = min(self.RECONNECT_MAX, backoff * 2) * (0.5 + random.random())
+                else:
+                    last_ping = time.time()
+                    backoff = self.RECONNECT_BASE
+                continue
                 
             except json.JSONDecodeError:
                 # Mensagem recebida não é JSON válido
                 print("\n[ERRO] Mensagem inválida recebida do servidor")
                 
+            except ConnectionError:
+                # Conexão fechada pelo par detectada pelo framing — tenta reconectar
+                print("\n[ERRO] Conexão encerrada — tentando reconectar...")
+                if not self._attempt_reconnect_inline(backoff):
+                    backoff = min(self.RECONNECT_MAX, backoff * 2) * (0.5 + random.random())
+                else:
+                    last_ping = time.time()
+                    backoff = self.RECONNECT_BASE
+                continue
+            
             except Exception as e:
                 # Outros erros de comunicação
                 print(f"\n[ERRO] Erro ao receber mensagem: {e}")
-                break
+                # Tenta reconectar também em erros gerais de socket
+                if not self._attempt_reconnect_inline(backoff):
+                    backoff = min(self.RECONNECT_MAX, backoff * 2) * (0.5 + random.random())
+                else:
+                    last_ping = time.time()
+                    backoff = self.RECONNECT_BASE
+                continue
         
         # Marca como desconectado ao sair do loop
         self.connected = False
+
+    def _attempt_reconnect_inline(self, delay: float) -> bool:
+        """
+        Tenta reconectar **nesta mesma thread** (sem criar nova thread de escuta),
+        respeitando um atraso (backoff) fornecido. Reutiliza _last_host/_last_port.
+        Se reconectar, refaz login automaticamente (se houver username).
+        """
+        try:
+            time.sleep(delay)
+            # Fecha socket antigo (se existir)
+            try:
+                if self.socket:
+                    self.socket.close()
+            except:
+                pass
+
+            # Cria novo socket e configura timeout
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect((self._last_host, self._last_port))
+
+            # Substitui o socket atual pela nova conexão
+            self.socket = sock
+            self.connected = True
+
+            # Reenvia login automaticamente (se já tínhamos username)
+            if self.username:
+                self.send_message({'type': 'login', 'username': self.username})
+            print("[OK] Reconectado.")
+            return True
+
+        except Exception as e:
+            print(f"[FALHA] Reconexão ainda não foi possível: {e}")
+            self.connected = False
+            return False
     
     def handle_server_message(self, message: dict):
         """
@@ -315,10 +444,9 @@ class ChatClient:
         """
         try:
             # Converte dict para JSON e codifica em bytes UTF-8
-            json_data = json.dumps(message).encode('utf-8')
-            
             # Envia via socket TCP
-            self.socket.send(json_data)
+            # Substituído por send_json (framing + sendall) para evitar envio parcial.
+            send_json(self.socket, message)
             
         except Exception as e:
             print(f"[ERRO] Não foi possível enviar mensagem: {e}")
@@ -345,8 +473,7 @@ class ChatClient:
                 self.send_message(message)
                 
                 # Aguarda resposta do servidor (método simplificado)
-                import time
-                time.sleep(0.5)
+                time.sleep(0.5)  # usando time já importado
                 
                 # Se ainda conectado, assume login bem-sucedido
                 if self.connected:
