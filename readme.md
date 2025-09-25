@@ -15,10 +15,11 @@ Implementação de um sistema de chat distribuído usando sockets TCP em Python.
 
 ✅ **Requisitos Não Funcionais Atendidos:**
 - Implementação obrigatória com sockets TCP
-- Servidor multithreaded para múltiplas conexões simultâneas
+- Servidor multithreaded com pool de threads para múltiplas conexões simultâneas
 - Interface de terminal (CLI) funcional
 - Tratamento de concorrência com locks
 - Estrutura de código bem organizada e comentada
+- Monitoramento de conexões ativas via heartbeat
 
 ## 🚀 Como Executar
 
@@ -233,8 +234,11 @@ ls client_downloads/
 
 ### Concorrência e Threading
 - **Servidor multithreaded:** Cada cliente conectado é gerenciado por uma thread separada
+- **Pool de threads:** Gerenciamento eficiente de conexões através de um pool fixo de threads
+- **Reutilização de threads:** As threads são reutilizadas para diferentes clientes, melhorando a eficiência
 - **Locks thread-safe:** Uso de `threading.Lock()` para proteger estruturas de dados compartilhadas
 - **Gerenciamento seguro:** Lista de clientes e grupos protegida contra race conditions
+- **Heartbeat:** Monitoramento constante das conexões para detectar clientes inativos ou desconectados
 
 ### Protocolo de Comunicação
 - **Formato JSON:** Todas as mensagens são enviadas em formato JSON

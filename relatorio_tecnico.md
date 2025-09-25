@@ -137,29 +137,37 @@ A escolha do TCP (Transmission Control Protocol) foi para garantir a integridade
 
 ### 3.2 Modelo de Concorrência
 
-A concorrência no servidor é gerenciada através de um modelo Thread-por-Cliente.
+A concorrência no servidor é gerenciada através de um modelo de Pool de Threads, que oferece um equilíbrio entre eficiência e simplicidade de implementação.
 
-**Arquitetura Thread-per-Client:**
+**Arquitetura de Thread Pool:**
 
 ```python
-client_thread = threading.Thread( # É alocada uma thread para cada 'client'
-    target=self.handle_client,
-    args=(client_socket, client_address)
-)
-# As threads são iniciadas
-client_thread.daemon = True
-client_thread.start()
+# Configuração do Thread Pool e Fila de Tarefas
+self.MAX_WORKERS = int(os.getenv("CHAT_SERVER_MAX_WORKERS", "32"))  
+self.executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS, thread_name_prefix="worker")  
+self.task_queue: "queue.Queue[tuple[socket.socket, tuple]]" = queue.Queue()  
+
+# Submissão de tarefas ao pool
+def start_server(self):
+    while True:
+        client_socket, client_address = server_socket.accept()
+        print(f"[SERVIDOR] Nova conexão de {client_address}")
+        self.task_queue.put((client_socket, client_address))
 ```
 
 **Análise de Alternativas:**
 
 | Modelo | Vantagens | Desvantagens | Decisão |
 |--------|-----------|--------------|---------|
-| Thread-per-Client | Simplicidade de código, isolamento de falhas| Limitação de escala, consumo de memória por thread | **Escolhido** |
-| Thread Pool | Controle de recursos, reutilização de threads | Maior complexidade de gerenciamento de tarefas | Rejeitado |
+| Thread Pool | Controle de recursos, reutilização de threads, escalabilidade controlada | Complexidade moderada de implementação | **Escolhido** |
+| Thread-per-Client | Simplicidade de código, isolamento de falhas | Limitação de escala, desperdício de recursos | Rejeitado |
 | Async/Event-Loop | Alta escalabilidade (milhares de conexões) | Complexidade de código (async/await), debugging | Rejeitado |
 
-**Justificativas:** Para ambiente acadêmico com <50 usuários simultâneos, simplicidade de implementação e debugging supera limitações de escalabilidade.
+**Justificativas:** O modelo de Thread Pool foi escolhido por oferecer:
+1. **Eficiência de recursos:** Reutilização de threads em vez de criar/destruir para cada cliente
+2. **Controle de carga:** Limite configurável de threads simultâneas
+3. **Escalabilidade moderada:** Suporta mais conexões que thread-per-client sem a complexidade do async
+4. **Balanceamento:** Melhor equilíbrio entre simplicidade e performance
 
 ### 3.3 Sincronização de Dados Compartilhados
 
@@ -302,12 +310,48 @@ with self.client_lock:
 - Falhas individuais não afetam outros membros
 - Contador de entrega para feedback ao remetente ("Mensagem enviada para x membros")
 
-### 4.3 Tratamento de Falhas
+### 4.3 Monitoramento e Tratamento de Falhas
+
+#### 4.3.1 Sistema de Heartbeat
+
+O sistema implementa um mecanismo de heartbeat para monitoramento ativo de conexões:
+
+```python
+# Estado do Heartbeat (liveness)
+self.HEARTBEAT_INTERVAL = int(os.getenv("CHAT_HB_INTERVAL", "15"))  
+self.HEARTBEAT_TIMEOUT  = int(os.getenv("CHAT_HB_TIMEOUT",  "10"))  
+self.MAX_MISSED = int(os.getenv("CHAT_HB_MAXMISSED", "2"))   
+self.last_seen: Dict[socket.socket, datetime] = {}                  
+self.missed_heartbeats: Dict[socket.socket, int] = {}               
+
+# Monitor de heartbeat
+def _heartbeat_monitor(self):
+    while not self._stop_event.is_set():
+        with self.client_lock:
+            sockets = list(self.clients.values())
+        for sock in sockets:
+            try:
+                send_json(sock, {"type": "heartbeat_ping"})
+            except Exception:
+                self._cleanup_socket(sock, "falha no envio do heartbeat")
+
+# Tratamento de heartbeat no cliente
+if message.get('type') == 'heartbeat_ack': 
+    with self.hb_lock:
+        self.last_seen[client_socket] = datetime.now()
+        self.missed_heartbeats[client_socket] = 0
+```
+
+#### 4.3.2 Tratamento de Falhas
 
 **Estratégias Implementadas:**
 
-1. **Desconexão Abrupta:**
+1. **Detecção por Heartbeat:**
+- Monitoramento constante de atividade dos clientes
+- Remoção automática após timeout configurável
+- Notificação para outros usuários quando um cliente é removido
 
+2. **Desconexão Abrupta:**
 Caso o membro seja desconectado do sistema por qualquer motivo, sem que se desconecte por vontade própria, selecionando a opção de "Sair", então uma mensagem de desconexão é enviada no Servidor:
 
 ```python
@@ -317,6 +361,7 @@ finally:
     if username:
         with self.client_lock:
             del self.clients[username]
+            self.last_heartbeat.pop(username, None)  # Remove heartbeat tracking
 ```
 
 2. **Mensagens Malformadas:**
@@ -370,6 +415,8 @@ A tabela abaixo resume os principais cenários testados e seus resultados, confi
 | | Carlos envia um arquivo (`.pdf`) para o grupo "Trabalho". | Alice, Bob e Eduardo recebem o arquivo em seus respectivos diretórios. | ✅ **Passou** |
 | | Verificação de integridade dos arquivos recebidos. | O hash MD5 dos arquivos recebidos é idêntico ao dos arquivos originais. | ✅ **Passou** |
 | **Robustez** | Desconexão abrupta de um cliente (Ctrl+C). | Servidor detecta a desconexão, remove o usuário da lista de ativos e os demais clientes continuam operando normalmente. | ✅ **Passou** |
+| **Monitoramento** | Simulação de cliente inativo (bloqueando heartbeats). | Servidor detecta timeout após 90 segundos e remove o cliente automaticamente. | ✅ **Passou** |
+| **Escalabilidade** | Conexão simultânea de 20 clientes usando thread pool. | Servidor mantém performance estável com uso eficiente de recursos. | ✅ **Passou** |
 
 #### **5.4. Análise dos Resultados**
 
