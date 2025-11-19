@@ -1,0 +1,3 @@
+# Ajuste se a sua versão gerada exigir mais nova
+grpcio>=1.62.0
+protobuf>=4.25.0
